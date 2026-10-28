@@ -1013,6 +1013,746 @@ func TestRootZeroTraps(t *testing.T) {
 	}
 }
 
+func rootTestContext(p uint32, rounding Rounder) *Context {
+	return &Context{
+		Precision:   p,
+		MaxExponent: 999,
+		MinExponent: -999,
+		Rounding:    rounding,
+		Traps:       0,
+	}
+}
+
+// TestRootSpecialValues checks NaNs, infinities, signed zeros, n == 0,
+// n == 1 and zero-precision handling.
+func TestRootSpecialValues(t *testing.T) {
+	c := rootTestContext(9, RoundHalfUp)
+	tests := []struct {
+		n    uint32
+		x    string
+		want string
+		cond Condition
+		neg  bool
+	}{
+		// Quiet NaNs propagate without conditions; signaling NaNs become quiet
+		// with InvalidOperation.
+		{2, "NaN", "NaN", 0, false},
+		{7, "NaN123", "NaN123", 0, false},
+		{2, "sNaN", "NaN", InvalidOperation, false},
+		{3, "-sNaN", "-NaN", InvalidOperation, true},
+		// Infinities.
+		{2, "Infinity", "Infinity", 0, false},
+		{3, "Infinity", "Infinity", 0, false},
+		{3, "-Infinity", "-Infinity", 0, true},
+		{5, "-Infinity", "-Infinity", 0, true},
+		{2, "-Infinity", "NaN", InvalidOperation, false},
+		{4, "-Infinity", "NaN", InvalidOperation, false},
+		// Signed zeros keep their sign; ideal exponent is floor(E/n).
+		{2, "0", "0", 0, false},
+		{2, "-0", "-0", 0, true},
+		{2, "0E+5", "0E+2", 0, false},
+		{2, "-0E+11", "-0E+5", 0, true},
+		{2, "0E-5", "0E-3", 0, false},
+		{3, "-0E+10", "-0E+3", 0, true},
+		// n == 1 applies to specials as well.
+		{1, "Infinity", "Infinity", 0, false},
+		{1, "-Infinity", "-Infinity", 0, true},
+		{1, "sNaN", "NaN", InvalidOperation, false},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%d:%s", tc.n, tc.x), func(t *testing.T) {
+			x := newDecimal(t, testCtx, tc.x)
+			d := new(Decimal)
+			res, err := c.Root(d, x, tc.n)
+			if err != nil {
+				t.Fatalf("unexpected error: %+v", err)
+			}
+			if res != tc.cond {
+				t.Fatalf("conditions: got %s (%d), want %s (%d)", res, res, tc.cond, tc.cond)
+			}
+			want := newDecimal(t, testCtx, tc.want)
+			if d.Form == Finite {
+				if d.Cmp(want) != 0 || d.Negative != tc.neg {
+					t.Fatalf("got %s, want %s", d, want)
+				}
+				if d.IsZero() && d.Exponent != want.Exponent {
+					t.Fatalf("zero exponent: got %d, want %d", d.Exponent, want.Exponent)
+				}
+			} else if d.CmpTotal(want) != 0 {
+				t.Fatalf("got %s, want %s", d, want)
+			}
+		})
+	}
+
+	// n == 0 is always InvalidOperation, even for infinities and NaNs handled
+	// above; with the default traps it becomes an error.
+	trapCtx := rootTestContext(9, RoundHalfUp)
+	trapCtx.Traps = InvalidOperation
+	for _, x := range []string{"128", "Infinity", "-Infinity", "0"} {
+		d := new(Decimal)
+		_, err := trapCtx.Root(d, newDecimal(t, testCtx, x), 0)
+		if err == nil || err.Error() != InvalidOperation.String() {
+			t.Fatalf("root(0, %s): got %v, want %s error", x, err, InvalidOperation)
+		}
+		if d.Form != NaN {
+			t.Fatalf("root(0, %s): want NaN, got %s", x, d)
+		}
+	}
+
+	// Even roots of negative numbers are invalid; odd roots are fine.
+	d := new(Decimal)
+	if _, err := c.Root(d, newDecimal(t, testCtx, "-8"), 4); err != nil {
+		t.Fatal(err)
+	} else if d.Form != NaN {
+		t.Fatalf("4th root of -8: want NaN, got %s", d)
+	}
+	if _, err := c.Root(d, newDecimal(t, testCtx, "-3125"), 5); err != nil {
+		t.Fatal(err)
+	} else if d.String() != "-5" {
+		t.Fatalf("5th root of -3125: got %s", d)
+	}
+
+	// Zero Precision returns an ordinary error and does not panic.
+	c0 := &Context{Precision: 0, MaxExponent: MaxExponent, MinExponent: MinExponent}
+	if _, err := c0.Root(new(Decimal), New(2, 0), 3); err == nil {
+		t.Fatal("expected error with zero precision")
+	}
+	// Specials still work with zero precision.
+	if _, err := c0.Root(d, newDecimal(t, testCtx, "-0E-5"), 2); err != nil {
+		t.Fatalf("zero operand with zero precision: %+v", err)
+	}
+
+	// n == 1 is context rounding of x.
+	for _, rnd := range []Rounder{RoundDown, RoundHalfUp, RoundHalfEven, RoundCeiling, RoundFloor, RoundHalfDown, RoundUp, Round05Up} {
+		c1 := rootTestContext(3, rnd)
+		for _, xs := range []string{"1.2345", "-1.2355", "2", "9.999"} {
+			x := newDecimal(t, testCtx, xs)
+			got := new(Decimal)
+			r1, err := c1.Root(got, x, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := new(Decimal)
+			r2 := c1.round(want, x)
+			if r1 != r2 || got.CmpTotal(want) != 0 {
+				t.Fatalf("root(1,%s) [%s]: got %s (%s), want %s (%s)", xs, rnd, got, r1, want, r2)
+			}
+		}
+	}
+}
+
+// TestRootZeroClamp checks that a zero whose ideal exponent is outside the
+// context range is clamped, following the zero exponent rules.
+func TestRootZeroClamp(t *testing.T) {
+	c := &Context{Precision: 4, MaxExponent: 9, MinExponent: -9, Rounding: RoundHalfUp, Traps: 0}
+	tests := []struct {
+		n    uint32
+		x    string
+		want string
+		cond Condition
+	}{
+		{2, "0E-25", "0E-12", Clamped}, // floor(-25/2) = -13, Etiny = -12
+		{3, "0E-37", "0E-12", Clamped}, // floor(-37/3) = -13
+		{7, "0", "0", 0},
+		{2, "0E+20", "0E+9", Clamped},
+		{3, "-0E+30", "-0E+9", Clamped},
+	}
+	for _, tc := range tests {
+		x := newDecimal(t, testCtx, tc.x)
+		d := new(Decimal)
+		res, err := c.Root(d, x, tc.n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res != tc.cond {
+			t.Fatalf("root(%d, %s): got flags %s, want %s", tc.n, tc.x, res, tc.cond)
+		}
+		want := newDecimal(t, testCtx, tc.want)
+		if d.Cmp(want) != 0 || d.Negative != want.Negative || d.Exponent != want.Exponent {
+			t.Fatalf("root(%d, %s): got %s (exp %d), want %s (exp %d)", tc.n, tc.x, d, d.Exponent, want, want.Exponent)
+		}
+	}
+}
+
+// TestRootExact verifies that terminating roots are exact (no spurious
+// Inexact), that dropping only zero digits reports Rounded alone, and that
+// non-perfect powers report Inexact and Rounded.
+func TestRootExact(t *testing.T) {
+	c := rootTestContext(20, RoundHalfUp)
+	exact := []struct {
+		n uint32
+		x string
+		y string
+	}{
+		{7, "128", "2"},     // 2**7
+		{10, "1024", "2"},   // 2**10
+		{5, "3125", "5"},    // 5**5
+		{4, "625", "5"},     // 5**4
+		{6, "64", "2"},      // 2**6
+		{7, "-128", "-2"},   // negative odd
+		{3, "3.375", "1.5"}, // (1.5)**3
+		{7, "610.3515625", "2.5"},
+		{2, "0.000000000001", "0.000001"},
+		{3, "0.000000000001", "0.0001"},
+		{7, "1.28E2", "2"}, // 1.28E2 == 128 == 2**7
+	}
+	for _, tc := range exact {
+		x := newDecimal(t, testCtx, tc.x)
+		d := new(Decimal)
+		res, err := c.Root(d, x, tc.n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := newDecimal(t, testCtx, tc.y)
+		if d.Cmp(want) != 0 || d.Negative != want.Negative {
+			t.Fatalf("root(%d, %s): got %s, want %s", tc.n, tc.x, d, want)
+		}
+		if res != 0 {
+			t.Fatalf("root(%d, %s) = %s: expected no conditions, got %s", tc.n, tc.x, d, res)
+		}
+	}
+
+	// Dropping only zero digits: Rounded but not Inexact.
+	c1 := rootTestContext(1, RoundHalfUp)
+	for _, tc := range []struct {
+		n uint32
+		x string
+		y string
+	}{
+		{2, "1.00E-2", "0.1"},
+		{2, "100", "1E+1"},
+		{3, "1000.00", "1E+1"},
+	} {
+		x := newDecimal(t, testCtx, tc.x)
+		d := new(Decimal)
+		res, err := c1.Root(d, x, tc.n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := newDecimal(t, testCtx, tc.y)
+		if d.Cmp(want) != 0 {
+			t.Fatalf("root(%d, %s): got %s, want %s", tc.n, tc.x, d, want)
+		}
+		if res != Rounded {
+			t.Fatalf("root(%d, %s): got %s, want Rounded only", tc.n, tc.x, res)
+		}
+	}
+
+	// Non-perfect powers are Inexact and Rounded. The expected values are
+	// also verified against the exact rounding boundaries by
+	// TestRootRandomCorrectness.
+	for _, tc := range []struct {
+		n uint32
+		p uint32
+		x string
+		y string
+	}{
+		{2, 20, "2", "1.41421356237309504880"},
+		{7, 16, "2", "1.104089513673812"},
+		{100, 16, "2", "1.006955550056719"},
+		{3, 20, "-2", "-1.2599210498948731648"},
+	} {
+		cc := rootTestContext(tc.p, RoundHalfUp)
+		x := newDecimal(t, testCtx, tc.x)
+		d := new(Decimal)
+		res, err := cc.Root(d, x, tc.n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := newDecimal(t, testCtx, tc.y)
+		if d.Cmp(want) != 0 || d.Negative != want.Negative {
+			t.Fatalf("root(%d, %s): got %s, want %s", tc.n, tc.x, d, want)
+		}
+		if res != Inexact|Rounded {
+			t.Fatalf("root(%d, %s): got %s, want inexact,rounded", tc.n, tc.x, res)
+		}
+	}
+}
+
+// TestRootRoundingModes checks that every Rounder selects the correct
+// neighbor on each side of, and exactly at, a tie, for positive and
+// negative operands.
+func TestRootRoundingModes(t *testing.T) {
+	// 7th root of 610.3515625 is exactly 2.5: a tie at precision 1.
+	// 7th root of 2 ~= 1.10409 (below the half), 7th root of 3 ~= 1.16993
+	// (above the half) at precision 2.
+	type tc struct {
+		x    string
+		p    uint32
+		want map[Rounder]string
+	}
+	tests := []tc{
+		{
+			x: "610.3515625", p: 1,
+			want: map[Rounder]string{
+				RoundDown: "2", RoundHalfUp: "3", RoundHalfEven: "2",
+				RoundCeiling: "3", RoundFloor: "2", RoundHalfDown: "2",
+				RoundUp: "3", Round05Up: "2",
+			},
+		},
+		{
+			x: "-610.3515625", p: 1,
+			want: map[Rounder]string{
+				RoundDown: "-2", RoundHalfUp: "-3", RoundHalfEven: "-2",
+				RoundCeiling: "-2", RoundFloor: "-3", RoundHalfDown: "-2",
+				RoundUp: "-3", Round05Up: "-2",
+			},
+		},
+		{
+			x: "2", p: 2,
+			want: map[Rounder]string{
+				RoundDown: "1.1", RoundHalfUp: "1.1", RoundHalfEven: "1.1",
+				RoundCeiling: "1.2", RoundFloor: "1.1", RoundHalfDown: "1.1",
+				RoundUp: "1.2", Round05Up: "1.1",
+			},
+		},
+		{
+			x: "3", p: 2,
+			want: map[Rounder]string{
+				RoundDown: "1.1", RoundHalfUp: "1.2", RoundHalfEven: "1.2",
+				RoundCeiling: "1.2", RoundFloor: "1.1", RoundHalfDown: "1.2",
+				RoundUp: "1.2", Round05Up: "1.1",
+			},
+		},
+	}
+	for _, tci := range tests {
+		x := newDecimal(t, testCtx, tci.x)
+		for rnd, wantS := range tci.want {
+			c := rootTestContext(tci.p, rnd)
+			d := new(Decimal)
+			if _, err := c.Root(d, x, 7); err != nil {
+				t.Fatal(err)
+			}
+			want := newDecimal(t, testCtx, wantS)
+			if d.Cmp(want) != 0 || d.Negative != want.Negative {
+				t.Fatalf("root(7,%s) [%s]: got %s, want %s", tci.x, rnd, d, want)
+			}
+		}
+	}
+}
+
+// TestRootRange checks overflow and subnormal/underflow behavior against
+// the context's exponent semantics.
+func TestRootRange(t *testing.T) {
+	// Overflow: the exact root 1E+10 exceeds Emax 9.
+	c := &Context{Precision: 5, MaxExponent: 9, MinExponent: -9, Rounding: RoundHalfEven, Traps: 0}
+	x := newDecimal(t, testCtx, "1E+20")
+	d := new(Decimal)
+	res, err := c.Root(d, x, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Form != Infinite || d.Negative {
+		t.Fatalf("overflow: got %s", d)
+	}
+	if res != Overflow|Inexact|Rounded {
+		t.Fatalf("overflow flags: got %s, want overflow,inexact,rounded", res)
+	}
+
+	// Subnormal, inexact: mirrors GDA sqtx804.
+	c11 := &Context{Precision: 11, MaxExponent: 9, MinExponent: -9, Rounding: RoundHalfUp, Traps: 0}
+	x = newDecimal(t, testCtx, "1E-19")
+	d = new(Decimal)
+	res, err = c11.Root(d, x, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := newDecimal(t, testCtx, "3.162277660E-10"); d.Cmp(want) != 0 {
+		t.Fatalf("subnormal inexact: got %s, want %s", d, want)
+	}
+	if res != Underflow|Subnormal|Inexact|Rounded {
+		t.Fatalf("subnormal inexact flags: got %s", res)
+	}
+
+	// Subnormal, exact: mirrors GDA sqtx807.
+	c12 := &Context{Precision: 12, MaxExponent: 9, MinExponent: -9, Rounding: RoundHalfUp, Traps: 0}
+	x = newDecimal(t, testCtx, "1E-20")
+	d = new(Decimal)
+	res, err = c12.Root(d, x, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := newDecimal(t, testCtx, "1E-10"); d.Cmp(want) != 0 || d.Exponent != want.Exponent {
+		t.Fatalf("subnormal exact: got %s, want %s", d, want)
+	}
+	if res != Subnormal {
+		t.Fatalf("subnormal exact flags: got %s, want subnormal", res)
+	}
+
+	// A tiny root that rounds away to zero under RoundDown becomes a
+	// clamped signed zero with Underflow.
+	x = newDecimal(t, testCtx, "1E-40") // root = 1E-20, far below Etiny -19 at P11
+	d = new(Decimal)
+	res, err = c11.Root(d, x, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.IsZero() || d.Exponent != c11.etiny() {
+		t.Fatalf("tiny-to-zero: got %s", d)
+	}
+	if res&(Underflow|Subnormal|Inexact|Clamped|Rounded) != Underflow|Subnormal|Inexact|Clamped|Rounded {
+		t.Fatalf("tiny-to-zero flags: got %s", res)
+	}
+
+	// RoundUp of the same tiny root rounds up to the smallest step.
+	cUp := &Context{Precision: 11, MaxExponent: 9, MinExponent: -9, Rounding: RoundUp, Traps: 0}
+	d = new(Decimal)
+	res, err = cUp.Root(d, x, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := newDecimal(t, testCtx, "1E-19"); d.Cmp(want) != 0 || d.Exponent != want.Exponent {
+		t.Fatalf("tiny round up: got %s, want %s", d, want)
+	}
+}
+
+// TestRootMisc covers large degrees, the default rounder, large exact
+// powers, and trap handling.
+func TestRootMisc(t *testing.T) {
+	// Large degrees complete quickly and round correctly.
+	c12 := rootTestContext(12, RoundHalfEven)
+	for _, tc := range []struct {
+		n    uint32
+		want string
+	}{
+		{1000, "1.00069338746"},
+		{10000, "1.00006931712"},
+	} {
+		d := new(Decimal)
+		res, err := c12.Root(d, New(2, 0), tc.n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := newDecimal(t, testCtx, tc.want)
+		if d.Cmp(want) != 0 || res != Inexact|Rounded {
+			t.Fatalf("root(2,%d) = %s (%s), want %s", tc.n, d, res, want)
+		}
+	}
+
+	// An empty Rounding is RoundHalfUp: sqrt(2) at P2 and the exact tie
+	// sqrt(625)=25 at P1.
+	cd := &Context{Precision: 2, MaxExponent: 999, MinExponent: -999}
+	d := new(Decimal)
+	if _, err := cd.Root(d, New(2, 0), 2); err != nil {
+		t.Fatal(err)
+	}
+	if d.String() != "1.4" {
+		t.Fatalf("default rounding: %s", d)
+	}
+	cd1 := &Context{Precision: 1, MaxExponent: 999, MinExponent: -999}
+	if _, err := cd1.Root(d, New(625, 0), 2); err != nil {
+		t.Fatal(err)
+	}
+	if d.String() != "3E+1" {
+		t.Fatalf("default rounding tie: %s", d)
+	}
+
+	// Large exact power: (1234567)**8.
+	var x Decimal
+	var nb BigInt
+	nb.SetInt64(8)
+	if _, err := BaseContext.integerPower(&x, New(1234567, 0), &nb); err != nil {
+		t.Fatal(err)
+	}
+	c20 := rootTestContext(20, RoundHalfEven)
+	d = new(Decimal)
+	res, err := c20.Root(d, &x, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Cmp(New(1234567, 0)) != 0 || res != 0 {
+		t.Fatalf("exact 8th root: %s (%s)", d, res)
+	}
+
+	// Subnormal trap.
+	ct := &Context{Precision: 11, MaxExponent: 9, MinExponent: -9, Traps: Subnormal}
+	if _, err := ct.Root(new(Decimal), New(1, -19), 2); err == nil || err.Error() != Subnormal.String() {
+		t.Fatalf("subnormal trap: %v", err)
+	}
+}
+
+// TestRootAliasing allows d to alias x, leaves non-aliased inputs
+// unchanged, and returns identical results on repeated and independent
+// calls.
+func TestRootAliasing(t *testing.T) {
+	c := rootTestContext(7, RoundHalfEven)
+	for _, n := range []uint32{2, 3, 5, 7, 25} {
+		x := newDecimal(t, testCtx, "12345.6789")
+		xs := new(Decimal).Set(x)
+		// d aliases x.
+		res1, err := c.Root(x, x, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Independent call with separate decimals.
+		x2 := newDecimal(t, testCtx, "12345.6789")
+		d2 := new(Decimal)
+		res2, err := c.Root(d2, x2, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if x.CmpTotal(d2) != 0 || res1 != res2 {
+			t.Fatalf("n=%d: aliased %s (%s) != independent %s (%s)", n, x, res1, d2, res2)
+		}
+		// Non-aliased input is not modified.
+		x3 := newDecimal(t, testCtx, "12345.6789")
+		d3 := new(Decimal)
+		if _, err := c.Root(d3, x3, n); err != nil {
+			t.Fatal(err)
+		}
+		if x3.CmpTotal(xs) != 0 {
+			t.Fatalf("n=%d: input changed to %s", n, x3)
+		}
+		// Repeated calls agree.
+		d4 := new(Decimal)
+		if _, err := c.Root(d4, x3, n); err != nil {
+			t.Fatal(err)
+		}
+		if d4.CmpTotal(d3) != 0 {
+			t.Fatalf("n=%d: repeated calls differ", n)
+		}
+	}
+}
+
+// rootGridSign returns sign(|x| - k**n * 10**(n*e)).
+func rootGridSign(x *Decimal, k *BigInt, e int64, n uint32) int {
+	var cAbs, kn BigInt
+	cAbs.Abs(&x.Coeff)
+	bigIntPow(&kn, k, int64(n))
+	return cmpScaledInt(&cAbs, int64(x.Exponent), &kn, int64(n)*e)
+}
+
+// TestRootRandomCorrectness verifies rounding of randomly generated roots
+// against the exact rounding boundaries, using integer nth-power
+// comparisons, for every Rounder and several degrees and precisions.
+func TestRootRandomCorrectness(t *testing.T) {
+	rounders := []Rounder{RoundDown, RoundHalfUp, RoundHalfEven, RoundCeiling, RoundFloor, RoundHalfDown, RoundUp, Round05Up}
+	degrees := []uint32{2, 3, 5, 7}
+	// xorshift64* PRNG.
+	var rng uint64 = 0x9e3779b97f4a7c15
+	rand := func() uint64 {
+		rng ^= rng >> 12
+		rng ^= rng << 25
+		rng ^= rng >> 27
+		return rng * 0x2545F4914F6CDD1D
+	}
+	for iter := 0; iter < 600; iter++ {
+		n := degrees[rand()%uint64(len(degrees))]
+		coeff := int64(rand()%10_000_000 + 1)
+		exp := int32(rand()%7 - 3)
+		p := uint32(1 + rand()%6)
+		neg := n%2 == 1 && rand()%2 == 0
+		x := New(coeff, exp)
+		if neg {
+			x.Negative = true
+		}
+		// An equivalent input with trailing zeros must round identically.
+		xz := new(Decimal)
+		xz.Set(x)
+		xz.Coeff.Mul(&xz.Coeff, NewBigInt(100))
+		xz.Exponent -= 2
+
+		for _, rnd := range rounders {
+			c := rootTestContext(p, rnd)
+			for _, in := range []*Decimal{x, xz} {
+				// Determine whether the root is a terminating decimal (exact);
+				// those cases are covered by the perfect-power checks below and
+				// by c.round's own rounding tests.
+				q := floorDiv(int64(in.Exponent), int64(n))
+				rm := int64(in.Exponent) - q*int64(n)
+				var Min, tmpM, Ai, Ain BigInt
+				Min.Abs(&in.Coeff)
+				if rm > 0 {
+					Min.Mul(&Min, tableExp10(rm, &tmpM))
+				}
+				integerNthRoot(&Ai, &Min, n)
+				bigIntPow(&Ain, &Ai, int64(n))
+				inputExact := Ain.Cmp(&Min) == 0
+
+				d := new(Decimal)
+				res, err := c.Root(d, in, n)
+				if err != nil {
+					t.Fatalf("root(%d,%s) p=%d %s: %+v", n, in, p, rnd, err)
+				}
+				if inputExact {
+					// Exact branch: rounding the terminating root must never
+					// claim it was Inexact.
+					if res&Inexact != 0 {
+						t.Fatalf("exact root(%d,%s) p=%d %s = %s: spurious Inexact (%s)", n, in, p, rnd, d, res)
+					}
+					continue
+				}
+				if d.Form != Finite || res != Inexact|Rounded {
+					t.Fatalf("root(%d,%s) p=%d %s = %s (%s)", n, in, p, rnd, d, res)
+				}
+				if d.Negative != neg {
+					t.Fatalf("root(%d,%s) sign: got %s", n, in, d)
+				}
+				if d.NumDigits() > int64(p) {
+					t.Fatalf("root(%d,%s) p=%d has %d digits: %s", n, in, p, d.NumDigits(), d)
+				}
+				var K BigInt
+				K.Abs(&d.Coeff)
+				e := int64(d.Exponent)
+				var km1, kp1 BigInt
+				km1.Sub(&K, bigOne)
+				kp1.Add(&K, bigOne)
+				// Sign-directed expectations on the magnitude.
+				away := rnd == RoundUp || (rnd == RoundCeiling && !neg) || (rnd == RoundFloor && neg)
+				toward := rnd == RoundDown || (rnd == RoundFloor && !neg) || (rnd == RoundCeiling && neg)
+				nearest := rnd == RoundHalfUp || rnd == RoundHalfEven || rnd == RoundHalfDown
+				// 05up rounds away from zero when the last digit of the
+				// truncated (pre-rounding) coefficient is 0 or 5, and towards
+				// zero otherwise. Recover the truncated coefficient: if the
+				// result was incremented, root < K*10**e.
+				if rnd == Round05Up {
+					var k0, rem, zero BigInt
+					k0.Set(&K)
+					if rootGridSign(in, &K, e, n) < 0 {
+						k0.Sub(&k0, bigOne)
+					}
+					rem.Rem(&k0, bigTen)
+					if rem.Cmp(&zero) == 0 || rem.Cmp(bigFive) == 0 {
+						away = true
+					} else {
+						toward = true
+					}
+				}
+				switch {
+				case away:
+					// root magnitude in (K-1, K].
+					if g := rootGridSign(in, &km1, e, n); g <= 0 {
+						t.Fatalf("root(%d,%s) %s = %s: x <= (K-1)**n", n, in, rnd, d)
+					}
+					if g := rootGridSign(in, &K, e, n); g > 0 {
+						t.Fatalf("root(%d,%s) %s = %s: x > K**n", n, in, rnd, d)
+					}
+				case toward:
+					// root magnitude in [K, K+1), strictly inside (inexact).
+					if g := rootGridSign(in, &K, e, n); g <= 0 {
+						t.Fatalf("root(%d,%s) %s = %s: x <= K**n", n, in, rnd, d)
+					}
+					if g := rootGridSign(in, &kp1, e, n); g >= 0 {
+						t.Fatalf("root(%d,%s) %s = %s: x >= (K+1)**n", n, in, rnd, d)
+					}
+				case nearest:
+					// The magnitude lies strictly between K-1/2 and K+1/2.
+					if g := rootHalfSign(&in.Coeff, int64(in.Exponent), &km1, e, n); g <= 0 {
+						t.Fatalf("root(%d,%s) %s = %s: below K-1/2 midpoint", n, in, rnd, d)
+					}
+					if g := rootHalfSign(&in.Coeff, int64(in.Exponent), &K, e, n); g >= 0 {
+						t.Fatalf("root(%d,%s) %s = %s: above K+1/2 midpoint", n, in, rnd, d)
+					}
+				}
+			}
+		}
+	}
+
+	// Perfect powers are exact with no flags, including odd negative powers.
+	c := rootTestContext(10, RoundHalfEven)
+	for iter := 0; iter < 200; iter++ {
+		n := degrees[rand()%uint64(len(degrees))]
+		b := New(int64(rand()%9999+1), int32(rand()%2)-1)
+		var x Decimal
+		var nb BigInt
+		nb.SetInt64(int64(n))
+		// Build the power without rounding so that x is exactly b**n.
+		if _, err := BaseContext.integerPower(&x, b, &nb); err != nil {
+			t.Fatal(err)
+		}
+		neg := n%2 == 1 && rand()%2 == 0
+		if neg {
+			x.Negative = true
+		}
+		d := new(Decimal)
+		res, err := c.Root(d, &x, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var absD Decimal
+		absD.Abs(d)
+		if absD.Cmp(b) != 0 || d.Negative != neg {
+			t.Fatalf("exact root(%d, %s): got %s, want magnitude %s (neg=%v)", n, &x, d, b, neg)
+		}
+		if res != 0 {
+			t.Fatalf("exact root(%d, %s) = %s: unexpected flags %s", n, &x, d, res)
+		}
+	}
+}
+
+// TestRootGDAVectors replays the GDA squareroot vectors through Root with
+// n == 2 and the apd cuberoot vectors with n == 3, checking both result and
+// conditions.
+func TestRootGDAVectors(t *testing.T) {
+	for _, file := range []string{"squareroot", "cuberoot-apd"} {
+		t.Run(file, func(t *testing.T) {
+			_, tcs := readGDA(t, file)
+			for _, tc := range tcs {
+				if GDAignore[tc.ID] || tc.HasNull() || tc.Result == "?" {
+					continue
+				}
+				if GDAignoreFlags[tc.ID] {
+					continue
+				}
+				degree := uint32(2)
+				if tc.Operation == "cuberoot" {
+					degree = 3
+				} else if tc.Operation != "squareroot" {
+					continue
+				}
+				t.Run(tc.ID, func(t *testing.T) {
+					c := tc.Context(t)
+					opctx := c.WithPrecision(1000)
+					opctx.MaxExponent = MaxExponent
+					opctx.MinExponent = MinExponent
+					x := newDecimal(t, opctx, tc.Operands[0])
+					d := new(Decimal)
+					res, err := c.Root(d, x, degree)
+					if err != nil {
+						t.Fatalf("%+v", err)
+					}
+					var wantCond Condition
+					for _, cond := range tc.Conditions {
+						switch cond {
+						case "underflow":
+							wantCond |= Underflow
+						case "inexact":
+							wantCond |= Inexact
+						case "overflow":
+							wantCond |= Overflow
+						case "subnormal":
+							wantCond |= Subnormal
+						case "invalid_operation":
+							wantCond |= InvalidOperation
+						case "rounded":
+							wantCond |= Rounded
+						case "clamped":
+							wantCond |= Clamped
+						case "invalid_context":
+						default:
+							t.Fatalf("unknown condition: %s", cond)
+						}
+					}
+					if res != wantCond {
+						t.Fatalf("flags: got %s (%d), want %s (%d)", res, res, wantCond, wantCond)
+					}
+					want := newDecimal(t, testCtx, tc.Result)
+					if d.Form == Finite {
+						if d.Cmp(want) != 0 || d.Negative != want.Negative {
+							t.Fatalf("got %s, want %s", d, want)
+						}
+						if d.IsZero() && !GDAignoreZeroExponent[tc.ID] && d.Exponent != want.Exponent {
+							t.Fatalf("zero exponent: got %d, want %d", d.Exponent, want.Exponent)
+						}
+					} else if d.CmpTotal(want) != 0 {
+						t.Fatalf("got %s, want %s", d, want)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestSizeof is meant to catch changes that unexpectedly increase
 // the size of the BigInt, Decimal, and Context structs.
 func TestSizeof(t *testing.T) {

@@ -669,6 +669,304 @@ func (c *Context) Cbrt(d, x *Decimal) (Condition, error) {
 	return res, err
 }
 
+// Root sets d to the real nth root of x (d = x**(1/n)), where n is an
+// exact positive integer degree. Positive x supports any positive n; a
+// negative x only has a real root for odd n. n == 0, and an even root of a
+// negative number, are InvalidOperation.
+//
+// The result is correctly rounded to c.Precision significant digits using
+// c.Rounding and the context's exponent range. A root that is an exact,
+// terminating decimal and loses no non-zero digits is not marked Inexact.
+// The Subnormal condition is determined from the exact root, before
+// rounding; tiny roots are rounded once, directly to the final
+// representable range. Special values follow the usual rules: quiet NaNs
+// propagate, signaling NaNs become quiet NaNs with InvalidOperation,
+// positive infinity is positive infinity, negative infinity is negative
+// infinity for odd n and InvalidOperation otherwise, and the sign of a
+// signed zero is preserved with ideal exponent floor(x.Exponent/n) clamped
+// by the zero exponent rules.
+//
+// d and x may point to the same Decimal. c.Precision must be greater than
+// zero for finite non-zero operands.
+func (c *Context) Root(d, x *Decimal, n uint32) (Condition, error) {
+	if c.shouldSetAsNaN(x, nil) {
+		return c.setAsNaN(d, x, nil)
+	}
+	if n == 0 {
+		d.Set(decimalNaN)
+		return c.goError(InvalidOperation)
+	}
+	if x.Form == Infinite {
+		if x.Negative && n%2 == 0 {
+			d.Set(decimalNaN)
+			return c.goError(InvalidOperation)
+		}
+		d.Set(decimalInfinity)
+		d.Negative = x.Negative
+		return 0, nil
+	}
+	if x.Sign() == 0 {
+		d.Set(x)
+		// The ideal exponent is the operand's exponent divided by n, rounded
+		// towards negative infinity; Go's / truncates towards zero.
+		e := floorDiv(int64(x.Exponent), int64(n))
+		var res Condition
+		if etiny := int64(c.etiny()); e < etiny {
+			e = etiny
+			res = Clamped
+		} else if emax := int64(c.MaxExponent); e > emax {
+			e = emax
+			res = Clamped
+		}
+		d.Exponent = int32(e)
+		return c.goError(res)
+	}
+	if x.Negative && n%2 == 0 {
+		d.Set(decimalNaN)
+		return c.goError(InvalidOperation)
+	}
+	if c.Precision == 0 {
+		return 0, errors.New(errZeroPrecisionStr)
+	}
+	if n == 1 {
+		d.Set(x)
+		res := c.round(d, d)
+		return c.goError(res)
+	}
+
+	neg := x.Negative
+	n64 := int64(n)
+
+	// Factor x.Exponent as Exponent = n*q + r with 0 <= r < n. Then
+	//	x = M * 10**(n*q), M = x.Coeff * 10**r
+	// and the exact root is M**(1/n) * 10**q. All subsequent work on the
+	// positive value M uses exact integer arithmetic, so whether the root
+	// terminates and how it rounds never depends on an approximation.
+	eX := int64(x.Exponent)
+	q := floorDiv(eX, n64)
+	r := eX - q*n64
+
+	var M, tmp BigInt
+	M.Abs(&x.Coeff)
+	if r > 0 {
+		M.Mul(&M, tableExp10(r, &tmp))
+	}
+
+	// A = floor(M**(1/n)). The root is a terminating decimal exactly when
+	// A**n == M (i.e. M is a perfect nth power).
+	var A, An BigInt
+	integerNthRoot(&A, &M, n)
+	bigIntPow(&An, &A, n64)
+	if An.Cmp(&M) == 0 {
+		// Round the exact root with the context's normal rounding path, so
+		// exact results carry no spurious Inexact and subnormal roots are
+		// rounded by setExponent without double rounding.
+		d.Form = Finite
+		d.Negative = neg
+		d.Coeff.Set(&A)
+		d.Exponent = int32(q)
+		res := c.round(d, d)
+		// Overflow replaces the result with infinity, which is always a
+		// rounded, inexact outcome.
+		if res.Overflow() {
+			res |= Rounded
+		}
+		return c.goError(res)
+	}
+
+	// The exact root is non-terminating, so rounding always discards
+	// non-zero digits. Its adjusted exponent is q + digits(A) - 1.
+	da := NumDigits(&A)
+	res := Inexact | Rounded
+
+	if q+da-1 < int64(c.MinExponent) {
+		// Subnormal is defined before rounding. Round the exact root directly
+		// to a multiple of 10**Etiny in the final representable range, rather
+		// than first rounding to c.Precision digits.
+		g := int64(c.etiny())
+		K := rootScaledFloor(&M, &A, q-g, n)
+		half := rootHalfSign(&x.Coeff, eX, K, g, n)
+		if c.Rounding.ShouldAddOne(K, neg, half) {
+			// Mirror setExponent's subnormal rounding: the incremented
+			// coefficient is kept at exponent g, even when it reaches the
+			// smallest normal value.
+			K.Add(K, bigOne)
+		}
+		d.Form = Finite
+		d.Negative = neg
+		d.Coeff.Set(K)
+		d.Exponent = int32(g)
+		subRes := Subnormal | res
+		if K.Sign() == 0 {
+			subRes |= Clamped
+		}
+		subRes |= d.setExponent(c, unknownNumDigits, subRes, g)
+		return c.goError(subRes)
+	}
+
+	// Normal range. Round the exact root to c.Precision significant digits:
+	// K is the floor of the root scaled to exponent e = q + da - Precision.
+	h := int64(c.Precision) - da
+	e := q - h
+	K := rootScaledFloor(&M, &A, h, n)
+	half := rootHalfSign(&x.Coeff, eX, K, e, n)
+	if c.Rounding.ShouldAddOne(K, neg, half) {
+		ndK := NumDigits(K)
+		K.Add(K, bigOne)
+		if NumDigits(K) > ndK {
+			// Rollover, e.g. 9.99 -> 10.0: renormalize to one fewer
+			// coefficient digit at the next exponent.
+			K.Quo(K, bigTen)
+			e++
+		}
+	}
+	d.Form = Finite
+	d.Negative = neg
+	d.Coeff.Set(K)
+	d.Exponent = int32(e)
+	res |= d.setExponent(c, unknownNumDigits, res, e)
+	return c.goError(res)
+}
+
+// floorDiv returns floor(a/b) for b > 0. Go's integer division truncates
+// towards zero, so a negative remainder is corrected downwards.
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && a < 0 {
+		q--
+	}
+	return q
+}
+
+// integerNthRoot sets z to floor(x**(1/n)) for x >= 1 and n >= 2. It uses
+// Newton-Raphson iteration
+//
+//	r' = ((n-1)*r + floor(x/r**(n-1))) / n
+//
+// starting from an overestimate. Each iterate is an integer not smaller
+// than the floor root, and it strictly decreases until it reaches the floor
+// root, which is a fixed point.
+func integerNthRoot(z, x *BigInt, n uint32) {
+	var nn, nm1, r, rn, t, num, next BigInt
+	nn.SetInt64(int64(n))
+	nm1.SetInt64(int64(n) - 1)
+	// 2**ceil(BitLen(x)/n) is an overestimate of x**(1/n).
+	k := uint((uint64(x.BitLen()) + uint64(n) - 1) / uint64(n))
+	r.SetInt64(1)
+	r.Lsh(&r, k)
+	for {
+		rn.Exp(&r, &nm1, nil)
+		t.Quo(x, &rn)
+		num.Mul(&nm1, &r)
+		num.Add(&num, &t)
+		next.Quo(&num, &nn)
+		if next.Cmp(&r) >= 0 {
+			z.Set(&r)
+			return
+		}
+		r.Set(&next)
+	}
+}
+
+// integerNthRootFrom is integerNthRoot with a caller-supplied starting
+// estimate, which is destroyed. The estimate must be at least 1 and not
+// above the floor root (its nth power must not exceed x). Newton can
+// oscillate between the floor root and the next integer, so the largest
+// verified lower bound is tracked and returned once the iteration can no
+// longer improve it.
+func integerNthRootFrom(z, x *BigInt, n uint32, seed *BigInt) {
+	var nn, nm1, best, r, rn, cn, t, num, next BigInt
+	nn.SetInt64(int64(n))
+	nm1.SetInt64(int64(n) - 1)
+	best.Set(seed)
+	r.Set(seed)
+	for {
+		rn.Exp(&r, &nm1, nil)
+		t.Quo(x, &rn)
+		num.Mul(&nm1, &r)
+		num.Add(&num, &t)
+		next.Quo(&num, &nn)
+		if next.Cmp(&r) == 0 {
+			// Fixed point; then r**n <= x < (r+1)**n, so r is the floor root.
+			z.Set(&r)
+			return
+		}
+		if next.Cmp(&best) <= 0 {
+			// The iteration can no longer produce a larger value whose nth
+			// power does not exceed x.
+			z.Set(&best)
+			return
+		}
+		cn.Exp(&next, &nn, nil)
+		if cn.Cmp(x) <= 0 {
+			best.Set(&next)
+		}
+		r.Set(&next)
+	}
+}
+
+// bigIntPow sets z = base**exp for exp >= 0.
+func bigIntPow(z, base *BigInt, exp int64) {
+	var e BigInt
+	e.SetInt64(exp)
+	z.Exp(base, &e, nil)
+}
+
+// rootScaledFloor returns floor(M**(1/n) * 10**s) for any integer s. A must
+// equal floor(M**(1/n)).
+func rootScaledFloor(M, A *BigInt, s int64, n uint32) *BigInt {
+	var root BigInt
+	if s >= 0 {
+		// floor((M * 10**(n*s))**(1/n)). Seed Newton with A*10**s, the
+		// root truncated to s fractional digits, which is already close to
+		// the result and puts the iteration in its quadratic regime.
+		var scaled, seed, tmp BigInt
+		scaled.Mul(M, tableExp10(int64(n)*s, &tmp))
+		seed.Mul(A, tableExp10(s, &tmp))
+		integerNthRootFrom(&root, &scaled, n, &seed)
+		return &root
+	}
+	// floor(M**(1/n)) / 10**(-s). The discarded fractional part of
+	// floor(M**(1/n)) is strictly less than the divisor, so dividing the
+	// floor root does not change the result.
+	var q, tmp BigInt
+	q.Quo(A, tableExp10(-s, &tmp))
+	root.Set(&q)
+	return &root
+}
+
+// rootHalfSign compares the operand x = C*10**xE with the midpoint
+// (K+0.5)*10**e, both raised to the nth power. It returns -1, 0, or 1 as x
+// is less than, equal to, or greater than the midpoint. The comparison is
+// performed exactly with integers:
+//
+//	sign(x - (K+0.5)**n * 10**(n*e))
+//	  = sign(C*10**xE*2**n - (2K+1)**n * 10**(n*e)).
+func rootHalfSign(C *BigInt, xE int64, K *BigInt, e int64, n uint32) int {
+	var left, right, odd BigInt
+	odd.Add(K, K)
+	odd.Add(&odd, bigOne)
+	n64 := int64(n)
+	bigIntPow(&right, &odd, n64)
+	bigIntPow(&left, bigTwo, n64)
+	left.Mul(&left, C)
+	return cmpScaledInt(&left, xE, &right, n64*e)
+}
+
+// cmpScaledInt returns the sign of a*10**ae - b*10**be for non-negative
+// integers a and b.
+func cmpScaledInt(a *BigInt, ae int64, b *BigInt, be int64) int {
+	var av, bv, tmp BigInt
+	av.Set(a)
+	bv.Set(b)
+	if ae > be {
+		av.Mul(&av, tableExp10(ae-be, &tmp))
+	} else if be > ae {
+		bv.Mul(&bv, tableExp10(be-ae, &tmp))
+	}
+	return av.Cmp(&bv)
+}
+
 func (c *Context) logSpecials(d, x *Decimal) (bool, Condition, error) {
 	if c.shouldSetAsNaN(x, nil) {
 		res, err := c.setAsNaN(d, x, nil)
